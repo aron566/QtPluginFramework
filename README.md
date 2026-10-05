@@ -1,6 +1,6 @@
-# BPLC_Plugin_Framework
+# QtPluginFramework
 
-BPLC 系列上位机的插件框架（从 HPLC_Wireshark 剥离）。
+通用的 Qt 插件框架（从 HPLC_Wireshark 剥离）。
 
 ## 组成
 
@@ -25,9 +25,9 @@ BPLC 系列上位机的插件框架（从 HPLC_Wireshark 剥离）。
 主程序 `.pro` 中：
 
 ```qmake
-BPLC_PLUGIN_FW = $$PWD/3rdparty/BPLC_Plugin_Framework  # 或 submodule 路径
-include($$BPLC_PLUGIN_FW/plugin.pri)
-INCLUDEPATH += $$BPLC_PLUGIN_FW/include/common $$BPLC_PLUGIN_FW/include/protocol
+PLUGIN_FW = $$PWD/3rdparty/QtPluginFramework  # 或 submodule 路径
+include($$PLUGIN_FW/plugin.pri)
+INCLUDEPATH += $$PLUGIN_FW/include/common $$PLUGIN_FW/include/protocol
 ```
 
 ## 许可证
