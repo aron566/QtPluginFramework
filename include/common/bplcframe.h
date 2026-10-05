@@ -1,0 +1,326 @@
+/// @file bplcframe.h
+/// @brief BPLC/HPLC+HRF 上位机协议帧的基础数据结构定义
+/// @details 本文件定义三块内容:
+///   - PhysicalMeta:从物理层剥头后提取的元信息(时间戳/信道/媒介等)
+///   - BplcFrame:一帧经哨兵切分+反转义后的完整载荷(送入解析器)
+///   - MpduInfo:MPDU 控制头解析结果(展示层用)
+///   - PacketEntry:Wireshark 风格 PacketList 的一行条目
+/// @note 不依赖 Qt MOC,可被非 Qt 模块 include
+/// @author BPLC_STA_QtMonitor
+/// @date 2026-09-05
+#ifndef BPLCFRAME_H
+#define BPLCFRAME_H
+
+#include <QByteArray>
+#include <QDateTime>
+#include <QPair>
+#include <QString>
+#include <QStringList>
+#include <QVector>
+
+/// @brief MSDU 跨帧重组状态(SOF 多 PB 块)
+struct MsduState {
+    QByteArray buffer;
+    int        received_count;
+    int        expected_len;
+    bool       complete;
+
+    MsduState() : received_count(0), expected_len(0), complete(false) {}
+};
+
+/// @brief 物理层元信息
+struct PhysicalMeta {
+    quint32  timestamp;       ///< STA 端 NTB 同步计数,25 kHz tick(40 µs/tick)
+    quint8   phr_mcs;         ///< HRF 物理头速率(PLC 帧此字段为占位 0)
+    quint8   option;          ///< HRF option(1=1M/2=500k/3=200k;PLC 占位)
+    quint16  channel;         ///< HRF:信道索引;PLC:频段号(0-3)
+    bool     is_rf;           ///< false=PLC 载波;true=HRF 无线
+    bool     has_time_tag;    ///< 是否携带 8 字节 BCD 时间标签(has_time_tag=1)
+    QDateTime frame_time;     ///< 帧时间(BCD 解码或 PC 本地时间)
+    qint64    epoch_ms;       ///< frame_time 的 epoch ms 缓存(热路径避免 toMSecsSinceEpoch 时区转换)
+    bool     from_raw;        ///< 是否为裸 hex 文本导入(无哨兵封装)
+    bool     frame_ts_is_ntb; ///< ts 域为 NTB tick(实时串口;25kHz,40µs);
+                              ///< false=文件回放(ts=epoch ms 低 32 位,毫秒级)
+    bool     seg_start;       ///< 本帧为新时间戳段首帧(跨段断点,Delta 不计算)
+
+    PhysicalMeta()
+        : timestamp(0), phr_mcs(0), option(0), channel(0),
+          is_rf(false), has_time_tag(false), epoch_ms(0),
+          from_raw(false), frame_ts_is_ntb(false), seg_start(false) {}
+};
+
+/// @brief 一帧完整载荷(经哨兵切分 + 0x3D 反转义后),完整定义见 TopoEvent 之后
+struct BplcFrame;
+
+/// @brief MPDU 控制头解析结果(展示层使用)
+struct MpduInfo {
+    quint8  frame_type;    ///< 定界符类型:0=BEACON 1=SOF 2=ACK 3=COORD 5=SEARCH 6=SWITCH
+    quint8  net_type;      ///< 网络类型(0/1)
+    quint32 net_id;        ///< 24-bit 网络标识
+    quint8  version;       ///< 标准版本号(0/1)
+    quint16 src_tei;       ///< 源 TEI(BEACON/SOF/ACK 解析后)
+    quint16 dst_tei;       ///< 目的 TEI(SOF/ACK 解析后)
+    quint8  link_id;       ///< SOF 链路标识符(8-bit)
+    quint16 frame_len;     ///< 帧长(×10µs,12-bit,SOF)
+    quint8  pb_num;        ///< 物理块个数(SOF 时,1-4)
+    quint16 symbol_num;    ///< 符号数 9-bit
+    bool    bc_flag;       ///< SOF 广播标志位
+    bool    re_send_flag;  ///< SOF 重发标志位
+    bool    encryp_flag;   ///< SOF 加密标志位
+    quint8  tmi;           ///< 分级拷贝基本模式(决定 PB Size)
+    quint8  tmi_ext;       ///< 分级拷贝扩展模式
+    quint16 pb_size;       ///< 由 TMI/TMI_EXT 查表得出的 PB 块大小(72/136/264/520)
+    bool    fch_crc_ok;    ///< 控制头 CRC24 校验结果
+    bool    pb_crc_ok;     ///< PB 块 CRC24 校验结果(SOF 时,全部块)
+    int     pb_index;      ///< PB 序号(分片重组时)
+    quint8  pb_head;       ///< PB 头原始字节(bit7=END bit6=START 低6位=seq;SOF 时,首块)
+    QVector<quint8> pb_heads;    ///< 各 PB 块头原始字节(按块序,SOF 时)
+    QVector<bool>   pb_crc_oks;  ///< 各 PB 块 CRC24 校验结果(按块序,SOF 时)
+
+    // ---- BEACON(帧内时间戳/相线)----
+    quint32 beacon_timestamp; ///< 信标帧内时间戳 32-bit(b4..b7)
+    quint8  beacon_line;      ///< 相线 2-bit(b11,1):0=Unknown 1=A 2=B 3=C
+
+    // ---- BEACON 载荷区(16B FCH 之后,经 PBSize 定位)----
+    quint8  beacon_type;      ///< 信标类型 3-bit(载荷区 0,0):0=STA 1=PCO 2=CCO
+    quint8  beacon_netsn;     ///< 组网序列号(载荷区 1,0,8)
+    quint64 beacon_cco_mac;   ///< CCO MAC 48-bit(载荷区 2,0,48,帧序显示)
+    quint32 beacon_period_cnt;///< 信标周期计数(载荷区 8,0,32)
+    quint8  beacon_rf_channel;///< 无线信道号(载荷区 12,0,8)
+    quint8  beacon_rf_option; ///< 无线 Option(载荷区 13,0,2)
+    int     beacon_item_num;  ///< 管理条目总数(载荷区 20 处 1B)
+
+    // ---- COORD(网间协调帧)----
+    quint16 coord_duration;   ///< 协调时隙占用时长 16-bit(ms)
+    quint16 coord_shift;      ///< 下次时隙偏移 16-bit(ms)
+    quint32 coord_neighbour_nid; ///< 邻居网络号 24-bit
+    quint8  coord_rf_channel; ///< 无线信道号 8-bit(表26 本网络无线信道编号)
+    quint8  coord_rsv0;       ///< 保留 4-bit(表26 字节12 bit0-3)
+    quint16 coord_rsv1;       ///< 保留 10-bit(表26 字节4-5)
+    quint8  coord_rsv2;       ///< 保留 1-bit(表26 字节7 bit0)
+    quint8  coord_rsv3;       ///< 保留 4-bit(表26 字节7 bit4-7)
+    // 南网 NW_2021 COORD 额外字段(国网填 0)
+    quint8  coord_band_end_flag;    ///< 频段时隙结束标志 1-bit(南网)
+    quint8  coord_option;           ///< Option 2-bit(南网)
+    quint16 coord_band_end_offset;  ///< 频段时隙结束偏移 16-bit(南网,×4ms)
+    quint16 coord_band_start_offset;///< 频段时隙开始偏移 16-bit(南网,×4ms)
+
+    // ---- ACK 扩展帧类型(12,0,4):0=常规 ACK 1=Search 2=Sync 3=切频 ----
+    quint8  ack_ext_type;     ///< ACK 扩展类型
+    quint8  ack_rx_res;       ///< RxRes 4-bit:0=接收成功(所有 PB CRC 通过) 1=接收失败(≥1 块 CRC 未过)
+    quint8  ack_rx_status;    ///< RxStatus 4-bit:PB CRC 通过位图(bit i=第 i+1 块)
+    quint8  ack_rx_pb_num;    ///< 接收 PB 数 3-bit
+    quint8  ack_rsv0;         ///< RSV0 5-bit(8,3,5)
+    quint8  ack_channel_quality; ///< 信道质量 8-bit(dB)
+    quint8  ack_sta_load;     ///< STA 负载 8-bit
+    quint8  ack_rsv1;         ///< RSV1 8-bit(11,0,8)
+    quint64 ack_dst_addr;     ///< 目标 MAC 48-bit(Search/切频)
+    quint16 ack_search_tei;   ///< Search STA TEI 12-bit
+    quint8  ack_search_freq;  ///< Search 频点 4-bit
+    quint32 ack_sync_timestamp; ///< Sync 时间戳 32-bit
+    quint16 ack_sync_tei;     ///< Sync TEI 12-bit
+
+    MpduInfo()
+        : frame_type(0), net_type(0), net_id(0), version(0),
+          src_tei(0), dst_tei(0), link_id(0), frame_len(0),
+          pb_num(0), symbol_num(0), bc_flag(false), re_send_flag(false),
+          encryp_flag(false), tmi(0), tmi_ext(0), pb_size(0),
+          fch_crc_ok(false), pb_crc_ok(false), pb_index(0), pb_head(0),
+          beacon_timestamp(0), beacon_line(0),
+          beacon_type(0), beacon_netsn(0), beacon_cco_mac(0),
+          beacon_period_cnt(0), beacon_rf_channel(0), beacon_rf_option(0),
+          beacon_item_num(0),
+          coord_duration(0), coord_shift(0), coord_neighbour_nid(0),
+          coord_rf_channel(0), coord_rsv0(0),
+          coord_rsv1(0), coord_rsv2(0), coord_rsv3(0),
+          coord_band_end_flag(0), coord_option(0),
+          coord_band_end_offset(0), coord_band_start_offset(0),
+          ack_ext_type(0), ack_rx_res(0), ack_rx_status(0), ack_rx_pb_num(0),
+          ack_rsv0(0), ack_channel_quality(0), ack_sta_load(0), ack_rsv1(0),
+          ack_dst_addr(0),
+          ack_search_tei(0), ack_search_freq(0),
+          ack_sync_timestamp(0), ack_sync_tei(0) {}
+
+    /// @brief 取 FrameType 对应的可读字符串
+    QString frame_type_name() const {
+        switch (frame_type) {
+            case 0: return QStringLiteral("BEACON");
+            case 1: return QStringLiteral("SOF");
+            case 2: return QStringLiteral("ACK");
+            case 3: return QStringLiteral("COORD");
+            case 5: return QStringLiteral("SEARCH");
+            case 6: return QStringLiteral("SWITCH");
+            default: return QStringLiteral("UNKNOWN(%1)").arg(frame_type);
+        }
+    }
+};
+
+/// @brief 一个解析出的字段(层级节点;自递归树)
+struct MsduFieldNode {
+    QString       name;      ///< 字段名(含 [Nbit] 标注)
+    QString       value;     ///< 值文本
+    QVector<MsduFieldNode> children;  ///< 子字段(分组/数组条目)
+    int           rel_start; ///< 相对 msdu_body 的起始字节(-1=无对应字节,如分组头)
+    int           rel_len;   ///< 覆盖字节数
+
+    MsduFieldNode() : rel_start(-1), rel_len(0) {}
+};
+
+/// @brief 管理帧携带的 TEI→MAC 学习对(供列表 TEI→MAC 映射表建立)
+struct TeiMacPair {
+    quint16 tei;   ///< TEI(12-bit)
+    quint64 mac;   ///< MAC 48-bit
+};
+
+/// @brief 拓扑事件类型(对应驱动拓扑变化的管理消息)
+enum class TopoEventKind {
+    DiscoverList,   ///< 发现列表(单节点快照:TEI/MAC/代理/层级)
+    AssocReq,       ///< 关联请求(STA 正在入网)
+    AssocCnf,       ///< 关联确认(STA 已入网)
+    AssocGatherInd, ///< 关联汇总指示(批量站点入网)
+    AssocInd,       ///< 关联指示(南网;拓扑语义等同关联确认)
+    ChangeProxyReq, ///< 代理变更请求(STA 请求换代理;仅记录,待确认后更新拓扑)
+    ChangeProxyCnf, ///< 代理变更确认(STA 换代理)
+    LeaveInd,       ///< 离网指示(STA 离网)
+    SuccessRate,    ///< 成功率上报(STA 与上级的上下行通讯成功率)
+    CcoRestart,     ///< CCO 重启(发现列表重启次数变化;仅 TopoState 内部生成,警告记录)
+    StaRestart,     ///< STA 重启(关联请求重启次数变化;仅 TopoState 内部生成,警告记录)
+    Other
+};
+
+/// @brief 通讯成功率信息(成功率上报条目;down/up 为百分比 0-100)
+struct CommRateInfo {
+    quint16 tei = 0;
+    quint8  down = 0; ///< 下行成功率 %(CCO/代理 → STA)
+    quint8  up = 0;   ///< 上行成功率 %(STA → CCO/代理)
+};
+
+/// @brief 从一帧管理消息提取的拓扑事件(协议无关;协议解析器在关键帧填充,
+///        拓扑窗口消费。kind==Other 表示非拓扑相关帧)
+struct TopoEvent {
+    TopoEventKind kind = TopoEventKind::Other;
+    quint32 nid = 0;
+    quint64 cco_mac = 0;                        ///< 本帧携带 CCO MAC(0=无)
+    QVector<TeiMacPair> nodes;                  ///< TEI→MAC 学习对
+    QVector<QPair<quint16, quint16>> routes;    ///< (子 TEI, 父/代理 TEI)
+    QVector<QPair<quint16, quint16>> up_routes; ///< 上行路由:(STA TEI, 下一跳 TEI),发现列表 UpRoute 条目(南网/国网)
+    quint16 discover_src_tei = 0;             ///< 发现列表发送方 TEI(0=无)
+    QVector<quint16> neighbor_teis;           ///< 发现列表位图邻居 TEI 列表(发送方见 discover_src_tei)
+    QVector<quint64> leaves;                    ///< 离网节点 MAC 列表
+    QVector<CommRateInfo> comm_rates;           ///< 成功率上报条目(SuccessRate 事件)
+    bool is_rf = false;                         ///< 接入方式:false=PLC 载波;true=HRF 无线
+    int restart_count = -1;                     ///< 发送方重启次数(南网 MAC 帧头 4-bit;-1=未知/无)
+    QString desc;                               ///< 变更说明(路由变更了什么)
+    qint64 epoch_ms = 0;                        ///< 时间点(epoch ms)
+    qint64 frame_index = -1;                    ///< 来源帧序号(PacketEntry::index;路由表显示与双击追溯用)
+};
+
+/// @brief 送入解析器/插件的一帧
+/// @details SerialReader 只填充 meta/data/raw_wire 等原始字段;主程序
+///          MainWindow::make_entry 完成协议解析后补 decoded_* 与 topo_event,
+///          再喂给插件引擎 —— 插件拿到的永远是"解析好的帧"(单入口 parse)。
+struct BplcFrame {
+    PhysicalMeta meta;            ///< 物理层元信息(由 SerialReader 填充部分)
+    QByteArray   data;            ///< 反转义 + 去哨兵后的净荷(含 isRF 字节 + PDU)
+    QString      error_reason;    ///< 非空:该帧被丢弃时附带原因
+    qint64       arrival_us;      ///< PC 收到帧起始分节符(0x3C)的单调高精度时刻
+                                  ///< (µs;仅实时串口填充,文件回放=0 → Delta 用文件时间戳)
+    QByteArray   raw_wire;        ///< 原始串口帧(0x3C...0x3E 含哨兵与 0x3D 转义,原样)
+
+    // ---- 主程序解析后填充(插件可见) ----
+    qint64    decoded_index = 0;    ///< 主程序帧序号(1-based;0=原始帧,未解码)
+    qint64    decoded_epoch_ms = 0; ///< 解析出的帧时刻(epoch ms;0=未知)
+    TopoEvent topo_event;           ///< 本帧携带的拓扑事件(kind=Other 表示无)
+    // ---- 标量透传:主程序已解析好的单值,插件直接取用,无需重解析 ----
+    bool     accepted = true;       ///< 主程序是否接受该帧(false=丢弃,原因见 error_reason)
+    MpduInfo mpdu;                  ///< MPDU 解析结果(主程序真值;替代插件侧重复解析)
+    QString  msdu_summary;          ///< MSDU 概要(如 "MMeDiscoverNodeList";无 MSDU 为空)
+    bool     msdu_present = false;  ///< 本帧是否携带完整 MSDU(重组完成)
+
+    BplcFrame() : arrival_us(0) {}
+};
+Q_DECLARE_METATYPE(BplcFrame)
+
+/// @brief MSDU 解析结果(由 GW_2022_MsduParser 填充)
+struct MsduInfo {
+    bool    present;         ///< 本帧携带完整 MSDU(重组完成)
+    bool    simple_head;     ///< 是否为 MSDU_BASE_S 简头(单跳)
+    quint16 msdu_seq;        ///< MSDU 序号(MSDU_BASE 的 MSDUIndex,16-bit)
+    int     msdu_src_tei;    ///< 原始发起 TEI(MSDU 头 SourceTEI;-1=无/简头)
+    int     msdu_dst_tei;    ///< 原始终点 TEI(MSDU 头 DestinationTEI;-1=无/简头)
+    int     msdu_send_type;  ///< 发送类型(MSDU 头 bit:0单播 1全网广播 2本地广播 3代理广播;-1=无)
+    quint64 msdu_src_mac;    ///< 源 MAC 48-bit(MSDU 头 MACAddrFlag=1 时;0=无)
+    quint64 msdu_dst_mac;    ///< 目的 MAC 48-bit(MSDU 头 MACAddrFlag=1 时;0=无)
+    quint64 sta_mac;         ///< 报文体携带的 STA MAC(如关联请求 STAMACAddr;0=无)
+    // 南网 NW_2021 MSDU 头字段(国网填 0)
+    quint32 vlan_tag;            ///< VLAN 标签 32-bit(南网 MSDU 长头)
+    quint16 msdu_type;           ///< MSDU 类型 16-bit(南网 MSDU 长头)
+    quint8  restart_count;       ///< 重启次数 4-bit(国网 MSDU 头/南网 MAC 帧头);0xFF=未知/无此字段
+    quint8  broadcast_direction; ///< 广播方向 4-bit(南网 MAC 帧头)
+    quint8  business_id;         ///< 应用层 BID(业务标识;非应用层报文=0xFF,供整行着色)
+    quint8  app_packet_type;     ///< 应用层帧类型域 4-bit(南网表4;非 NW 应用层=0xFF)
+    quint16 mme_type;            ///< 管理消息 MMe 类型(16bit;非管理消息=0xFFFF,供整行着色)
+    int     total_len;       ///< MSDU 帧总长(头+数据+CRC,不含 PB 填充;-1=未知)
+    QString summary;         ///< 概要,如 "MMeDiscoverNodeList" / "APP EventPacket"
+    QVector<MsduFieldNode> tree;  ///< 字段树(协议树直接挂载显示)
+    QVector<TeiMacPair> tei_mac_pairs; ///< 本帧携带的 TEI→MAC 学习对(发现列表等)
+    TopoEvent topo_event;        ///< 拓扑事件(关键管理消息填充;kind=Other 表示无)
+
+    MsduInfo() : present(false), simple_head(false), msdu_seq(0),
+                 msdu_src_tei(-1), msdu_dst_tei(-1), msdu_send_type(-1),
+                 msdu_src_mac(0), msdu_dst_mac(0), sta_mac(0),
+                 vlan_tag(0), msdu_type(0), restart_count(0xFF),
+                 broadcast_direction(0), business_id(0xFF), app_packet_type(0xFF),
+                 mme_type(0xFFFF), total_len(-1) {}
+};
+
+/// @brief Wireshark 风格 PacketList 的一行条目
+struct PacketEntry {
+    int          index;        ///< 序号(从 1 开始累加)
+    qint64       epoch_ms;     ///< PC 收到时刻(epoch ms)
+    qint64       delta_us;     ///< 与上一帧的时间差(µs;NTB 40µs 分辨,不可比时=ms×1000)
+    bool         accepted;     ///< true=accepted, false=dropped(CRC 错或格式异常)
+    QString      reason;       ///< dropped 时填原因
+    QByteArray   raw_wire;     ///< 原始串口帧(0x3C...0x3E 原样,含转义;调试/复制用)
+    PhysicalMeta meta;         ///< 物理层元信息
+    MpduInfo     mpdu;         ///< MPDU 解析结果
+    QByteArray   msdu_body;    ///< 重组后的 MSDU body(若完成)
+    MsduInfo     msdu;         ///< MSDU/MAC 层字段解析(若重组完成)
+    MsduInfo     beacon;       ///< BEACON 载荷区字段解析(仅 BEACON 帧)
+    int          msdu_raw_base;///< MSDU body 在 raw_bytes 中的偏移;-1=不在本帧(跨帧重组)
+    QByteArray   raw_bytes;    ///< 原始字节,用于 HexView 显示
+    QString      search_text;  ///< 可搜索全文缓存(小写;make_entry/反序列化时填充,过滤匹配用)
+
+    PacketEntry()
+        : index(0), epoch_ms(0), delta_us(0), accepted(false),
+          msdu_raw_base(-1) {}
+};
+
+/// @brief 生成一行的可搜索全文(小写),供过滤器快速匹配;缓存于 PacketEntry::search_text
+inline QString make_search_text(const PacketEntry& e) {
+    QStringList parts;
+    parts << QString::number(e.index);
+    if (!e.accepted) {
+        parts << QStringLiteral("drop") << QStringLiteral("err");
+        parts << e.reason.toLower();
+        return parts.join(QLatin1Char(' '));
+    }
+    parts << (e.meta.is_rf ? QStringLiteral("hrf") : QStringLiteral("hplc"))
+          << QStringLiteral("plc");
+    parts << e.mpdu.frame_type_name().toLower();
+    parts << (e.mpdu.src_tei == 0x0001 ? QStringLiteral("cco")
+            : e.mpdu.src_tei != 0      ? QStringLiteral("sta-%1").arg(e.mpdu.src_tei)
+            : e.meta.is_rf ? QStringLiteral("hrf") : QStringLiteral("plc"));
+    parts << (e.mpdu.dst_tei == 0xFFF ? QStringLiteral("broadcast")
+            : e.mpdu.dst_tei == 0x0001 ? QStringLiteral("cco")
+            : e.mpdu.dst_tei != 0      ? QStringLiteral("sta-%1").arg(e.mpdu.dst_tei)
+                                       : QStringLiteral("*"));
+    const QString nid = QString::number(e.mpdu.net_id, 16);
+    parts << nid << QStringLiteral("0x%1").arg(nid);
+    parts << QString::number(e.mpdu.src_tei) << QString::number(e.mpdu.dst_tei);
+    if (e.msdu.present) parts << e.msdu.summary.toLower();
+    return parts.join(QLatin1Char(' '));
+}
+Q_DECLARE_METATYPE(PacketEntry)
+
+#endif // BPLCFRAME_H
