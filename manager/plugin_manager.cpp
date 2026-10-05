@@ -20,7 +20,6 @@
 #include "plugin_ipc.h"
 #include "plugin_serialization.h"
 #include "plugin_parser_proxy.h"
-#include "protocolfactory.h"
 
 namespace {
 constexpr int kHandshakeTimeoutMs = 10000;
@@ -177,9 +176,10 @@ void PluginManager::handle_message(const QString& plugin_id, quint8 type,
         if (ok) {
             rt->ready = true;
             rt->last_pong_ms = QDateTime::currentMSecsSinceEpoch();
-            // 注册到解析器工厂(插件协议 id → 代理)
+            // 注册到解析器工厂(插件协议 id → 代理),经主程序注入的回调
             const QString pid = rt->manifest.protocol_id;
-            register_parser(pid, [pid]() { return make_plugin_parser(pid); });
+            if (m_registry.register_fn)
+                m_registry.register_fn(pid, [pid]() { return make_plugin_parser(pid); });
             emit plugin_status_changed(plugin_id, QStringLiteral("ready"));
         } else {
             disable_plugin(plugin_id, QStringLiteral("handshake failed"));
@@ -319,7 +319,8 @@ void PluginManager::disable_plugin(const QString& plugin_id,
     rt->disabled = true;
     rt->disable_reason = reason;
     rt->ready = false;
-    unregister_parser(rt->manifest.protocol_id);
+    if (m_registry.unregister_fn)
+        m_registry.unregister_fn(rt->manifest.protocol_id);
     emit plugin_status_changed(plugin_id, QStringLiteral("disabled: ") + reason);
 }
 

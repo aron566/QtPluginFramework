@@ -6,9 +6,9 @@
 QT += qml
 
 INCLUDEPATH += $$PWD/../plugin_api $$PWD/../host $$PWD \
-               $$PWD/../../common $$PWD/../../protocol
+               $$PWD/../include/common $$PWD/../include/protocol
 DEPENDPATH  += $$PWD/../plugin_api $$PWD/../host $$PWD \
-               $$PWD/../../common $$PWD/../../protocol
+               $$PWD/../include/common $$PWD/../include/protocol
 
 # Lua 5.4 (3rdparty 内嵌,缺失时自动获取源码并构建;见 lua_bundle.pri)
 include(../lua_bundle.pri)

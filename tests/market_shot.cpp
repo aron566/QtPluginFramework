@@ -3,7 +3,7 @@
 #include <QApplication>
 #include <QTimer>
 
-#include "../../common/i18n.h"
+#include "i18n.h"
 #include "market_dialog.h"
 
 int main(int argc, char** argv) {

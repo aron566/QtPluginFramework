@@ -13,6 +13,7 @@
 #include <QMap>
 #include <QMutex>
 #include <QTimer>
+#include <functional>
 
 #include "bplcframe.h"
 #include "igraphicsplugin.h"
@@ -23,6 +24,14 @@ class QLocalServer;
 class QLocalSocket;
 class QProcess;
 class PluginGraphicsView;
+
+/// @brief 解析器注册回调(由主程序注入,解耦对具体协议工厂的依赖)
+/// @details register_fn: protocol_id → 工厂函数; unregister_fn: 移除 protocol_id
+struct ParserRegistry {
+    std::function<void(const QString&,
+                       std::function<std::unique_ptr<IProtocolParser>()>)> register_fn;
+    std::function<void(const QString&)> unregister_fn;
+};
 
 /// @brief 单个插件的运行时状态
 struct PluginRuntime {
@@ -47,6 +56,8 @@ public:
 
     /// @brief 扫描并启动 plugins_dir 下所有插件
     void loadAll(const QString& plugins_dir);
+    /// @brief 设置解析器注册回调(主程序在 loadAll 前调用,注入协议工厂)
+    void set_parser_registry(ParserRegistry reg) { m_registry = std::move(reg); }
     /// @brief 已注册的插件协议 id 列表(供 UI/配置)
     QStringList pluginProtocolIds() const;
     /// @brief 协议 id 是否来自插件
@@ -93,6 +104,7 @@ private:
     QMap<QString, PluginRuntime*> m_plugins;  ///< key: protocol_id
     QMap<QString, QList<PluginGraphicsView*>> m_graphics_views;  ///< key: protocol_id
     QTimer m_hb_timer;
+    ParserRegistry m_registry;  ///< 主程序注入的解析器注册回调
 };
 
 #endif // BPLC_PLUGIN_MANAGER_H

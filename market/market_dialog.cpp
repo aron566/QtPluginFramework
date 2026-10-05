@@ -31,7 +31,7 @@
 
 #include <climits>
 
-#include "../../common/i18n.h"
+#include "i18n.h"
 #include "../plugin_api/plugin_env.h"
 
 namespace {

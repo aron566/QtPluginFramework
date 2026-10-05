@@ -2,15 +2,17 @@
 QT += network
 
 INCLUDEPATH += $$PWD
-INCLUDEPATH += $$PWD/../../../3rdparty/miniz
+INCLUDEPATH += $$PWD/../3rdparty/miniz
+INCLUDEPATH += $$PWD/../include/common $$PWD/../include/protocol
+DEPENDPATH  += $$PWD/../include/common $$PWD/../include/protocol
 
 SOURCES += \
     $$PWD/plugin_market.cpp \
     $$PWD/market_dialog.cpp \
-    $$PWD/../../../3rdparty/miniz/miniz.c \
-    $$PWD/../../../3rdparty/miniz/miniz_tdef.c \
-    $$PWD/../../../3rdparty/miniz/miniz_tinfl.c \
-    $$PWD/../../../3rdparty/miniz/miniz_zip.c
+    $$PWD/../3rdparty/miniz/miniz.c \
+    $$PWD/../3rdparty/miniz/miniz_tdef.c \
+    $$PWD/../3rdparty/miniz/miniz_tinfl.c \
+    $$PWD/../3rdparty/miniz/miniz_zip.c
 
 HEADERS += \
     $$PWD/plugin_market.h \

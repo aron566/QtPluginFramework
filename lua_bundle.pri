@@ -10,7 +10,7 @@
 # 里;全新 checkout 第 1 步会自动解压,否则 qmake 的 cd 会报"系统找不到指定的路径"。
 
 _LUA_PWD = $$PWD
-_LUA_THIRDPARTY = $$_LUA_PWD/../../3rdparty
+_LUA_THIRDPARTY = $$_LUA_PWD/3rdparty
 LUA_DIR = $$_LUA_THIRDPARTY/lua-5.4.6
 LUA_SRC = $$LUA_DIR/src
 LUA_LIB = $$LUA_SRC/liblua.a

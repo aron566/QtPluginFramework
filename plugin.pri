@@ -3,7 +3,9 @@
 
 QT += core network
 
-INCLUDEPATH += $$PWD/plugin_api $$PWD/ipc $$PWD/manager
+INCLUDEPATH += $$PWD/plugin_api $$PWD/ipc $$PWD/manager \
+    $$PWD/include/common $$PWD/include/protocol
+DEPENDPATH += $$PWD/include/common $$PWD/include/protocol
 DEPENDPATH  += $$PWD/plugin_api $$PWD/ipc $$PWD/manager
 
 HEADERS += \
@@ -21,4 +23,5 @@ SOURCES += \
     $$PWD/ipc/plugin_serialization.cpp \
     $$PWD/manager/plugin_manager.cpp \
     $$PWD/manager/plugin_parser_proxy.cpp \
-    $$PWD/manager/plugin_graphics_view.cpp
+    $$PWD/manager/plugin_graphics_view.cpp \
+    $$PWD/src/i18n.cpp

@@ -12,8 +12,6 @@
 
 #include "i18n.h"
 #include "plugin_backend.h"
-#include "appconfig.h"
-#include "theme.h"
 
 namespace {
 
@@ -123,15 +121,8 @@ void PluginWorker::start_load(const QString& dir) {
             continue;
         }
         b->set_ui_english(trl::enabled());
-        // 界面主题:按 appcfg::theme 解析后是否深色注入(供 host.getEnv("BPLC_THEME"))
-        {
-            const QString t = appcfg::theme();
-            const bool dark =
-                (t == QLatin1String("dark")) ||
-                (t != QLatin1String("light") &&
-                 theme::resolve_auto() == QLatin1String("dark"));
-            b->set_ui_dark(dark);
-        }
+        // 界面主题:用主程序注入的 m_ui_dark(供 host.getEnv("BPLC_THEME"))
+        b->set_ui_dark(m_ui_dark);
         if (m.graphics && !b->has_graphics()) {
             // 声明了图形但后端无图形能力:降级为 stats 面板,保留解析
             info.panel = QStringLiteral("stats");
@@ -338,6 +329,9 @@ LocalPluginEngine::~LocalPluginEngine() {
 }
 
 void LocalPluginEngine::load(const QString& dir) {
+    // 先把主题注入工作线程,再开始加载(保证 start_load 时 m_ui_dark 已就绪)
+    QMetaObject::invokeMethod(m_worker, "set_ui_dark", Qt::BlockingQueuedConnection,
+                              Q_ARG(bool, m_ui_dark));
     QMetaObject::invokeMethod(m_worker, "start_load", Qt::QueuedConnection,
                               Q_ARG(QString, dir));
 }

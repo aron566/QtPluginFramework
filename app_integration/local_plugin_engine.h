@@ -59,6 +59,8 @@ public:
 
 public slots:
     void start_load(const QString& dir);
+    /// @brief 设置初始 UI 深色模式(主程序在 start_load 前调用)
+    void set_ui_dark(bool dark) { m_ui_dark = dark; }
     /// @brief 喂一帧(解析好的帧,带帧序号/时间戳/topoEvent)
     void on_frame(const BplcFrame& f);
     void request_render(const QString& pid, int w, int h);
@@ -96,6 +98,7 @@ private:
     QAtomicInt m_pending{0};
     qint64 m_frame_seq = 0;
     QString m_dir;
+    bool m_ui_dark = false;  // 由 LocalPluginEngine 经 set_ui_dark() 注入
 };
 
 /// @brief 主界面侧插件引擎(GUI 线程门面,转发到工作线程)
@@ -126,6 +129,8 @@ public slots:
     void notify_frame_selected(qint64 frame_index, bool force_history = false);
     /// @brief 主界面主题切换(GUI 线程调用,排队到工作线程更新各后端 ui_dark)
     void notify_theme_changed(bool dark);
+    /// @brief 设置初始 UI 深色模式(主程序在 load() 前调用;替代直接读 app 配置)
+    void set_ui_dark(bool dark) { m_ui_dark = dark; }
     void reset_all();
 
 signals:
@@ -144,6 +149,7 @@ signals:
 private:
     QThread*      m_thread = nullptr;
     PluginWorker* m_worker = nullptr;
+    bool          m_ui_dark = false;  // 由主程序经 set_ui_dark() 注入
 };
 
 #endif // BPLC_LOCAL_PLUGIN_ENGINE_H

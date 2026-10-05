@@ -4,3 +4,7 @@ build*/
 *.dll
 Makefile
 .qmake.stash
+
+# lua 源码解压目录(构建产物,tarball 在版本库)
+3rdparty/lua-5.4.6/
+!3rdparty/lua-5.4.6.tar.gz
