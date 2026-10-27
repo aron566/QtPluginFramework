@@ -13,8 +13,8 @@ INCLUDEPATH += ../plugin_api ../ipc
 DEPENDPATH  += ../plugin_api ../ipc
 
 # 主程序公共结构头文件(bplcframe.h / iprotocolparser.h)
-INCLUDEPATH += ../../common ../../protocol ../../protocol/common
-DEPENDPATH  += ../../common ../../protocol ../../protocol/common
+INCLUDEPATH += ../include/common ../include/protocol ../include/protocol/common
+DEPENDPATH  += ../include/common ../include/protocol ../include/protocol/common
 
 # Lua 5.4 (3rdparty 内嵌,缺失时自动获取源码并构建;见 lua_bundle.pri)
 include(../lua_bundle.pri)

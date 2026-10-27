@@ -1,0 +1,341 @@
+/// @file plugin_ipc.proto
+/// @brief 插件 IPC 的 protobuf 线格式(主程序 ↔ bplc-plugin-host)
+/// @details 传输:QLocalSocket;帧格式:[quint32 总长][Envelope protobuf 字节]。
+///          旧格式 [quint32 总长][quint8 类型][QDataStream 载荷] 已废弃
+///          (kApiVersion 1 → 2,见 ipc/plugin_ipc.h)。
+///          演进规则:新增字段一律追加新字段号,不得复用/改义旧号;
+///          旧字段只可废弃(reserved),不可删除。
+///          本 schema 对应 proto_schema_version = 1(Hello 协商用)。
+///          字段类型对照 Qt:quint8/16/32 → uint32,quint64 → uint64,
+///          int/qint64(可为负) → sint32/sint64,QString → string,
+///          QByteArray/QVector<quint8> → bytes,bool → bool。
+syntax = "proto3";
+
+package qtplugin.ipc;
+
+// ---- 拓扑事件类型(与 bplcframe.h TopoEventKind 数值一致) ----
+enum TopoEventKind {
+  TOPO_DISCOVER_LIST = 0;
+  TOPO_ASSOC_REQ = 1;
+  TOPO_ASSOC_CNF = 2;
+  TOPO_ASSOC_GATHER_IND = 3;
+  TOPO_ASSOC_IND = 4;
+  TOPO_CHANGE_PROXY_REQ = 5;
+  TOPO_CHANGE_PROXY_CNF = 6;
+  TOPO_LEAVE_IND = 7;
+  TOPO_SUCCESS_RATE = 8;
+  TOPO_CCO_RESTART = 9;
+  TOPO_STA_RESTART = 10;
+  TOPO_OTHER = 11;
+}
+
+// ---- 图形事件类型(与 igraphicsplugin.h GraphicsEventType 数值一致) ----
+enum GraphicsEventType {
+  GFX_MOUSE_PRESS = 0;
+  GFX_MOUSE_RELEASE = 1;
+  GFX_MOUSE_MOVE = 2;
+  GFX_WHEEL = 3;
+  GFX_RESIZE = 4;
+  GFX_LEAVE = 5;
+  GFX_MOUSE_DBL_CLICK = 6;
+}
+
+// ---- 信封状态 ----
+enum Status {
+  STATUS_OK = 0;
+  STATUS_ERROR = 1;
+}
+
+// ---- 物理层元信息(线上传输子集,与旧 QDataStream 顺序一致:
+//      timestamp/phr_mcs/option/channel/is_rf;其余 PhysicalMeta 字段
+//      (has_time_tag/frame_time/epoch_ms/...) 本就不上 IPC 线,日后如需
+//      上线以新字段号追加,不得改动现有字段号) ----
+message PhysicalMeta {
+  uint32 timestamp = 1;  // STA 端 NTB 同步计数,25 kHz tick
+  uint32 phr_mcs = 2;    // HRF 物理头速率(PLC 帧占位 0)
+  uint32 option = 3;     // HRF option(1=1M/2=500k/3=200k;PLC 占位)
+  uint32 channel = 4;    // HRF 信道索引;PLC 频段号(0-3)
+  bool is_rf = 5;        // false=PLC 载波;true=HRF 无线
+}
+
+message TeiMacPair {
+  uint32 tei = 1;
+  uint64 mac = 2;  // MAC 48-bit
+}
+
+message CommRateInfo {
+  uint32 tei = 1;
+  uint32 down = 2;  // 下行成功率 %
+  uint32 up = 3;    // 上行成功率 %
+}
+
+message RoutePair {
+  uint32 first = 1;   // 子 TEI
+  uint32 second = 2;  // 父/代理 TEI(或下一跳 TEI)
+}
+
+message TopoEvent {
+  TopoEventKind kind = 1;
+  uint32 nid = 2;
+  uint64 cco_mac = 3;  // 0=无
+  repeated TeiMacPair nodes = 4;
+  repeated RoutePair routes = 5;
+  repeated RoutePair up_routes = 6;
+  uint32 discover_src_tei = 7;  // 0=无
+  repeated uint32 neighbor_teis = 8;
+  repeated uint64 leaves = 9;  // 离网节点 MAC 列表
+  repeated CommRateInfo comm_rates = 10;
+  bool is_rf = 11;
+  sint32 restart_count = 12;  // -1=未知/无
+  string desc = 13;
+  sint64 epoch_ms = 14;
+  sint64 frame_index = 15;  // -1=无
+}
+
+message MpduInfo {
+  uint32 frame_type = 1;
+  uint32 net_type = 2;
+  uint32 net_id = 3;
+  uint32 version = 4;
+  uint32 src_tei = 5;
+  uint32 dst_tei = 6;
+  uint32 link_id = 7;
+  uint32 frame_len = 8;
+  uint32 pb_num = 9;
+  uint32 symbol_num = 10;
+  bool bc_flag = 11;
+  bool re_send_flag = 12;
+  bool encryp_flag = 13;
+  uint32 tmi = 14;
+  uint32 tmi_ext = 15;
+  uint32 pb_size = 16;
+  bool fch_crc_ok = 17;
+  bool pb_crc_ok = 18;
+  sint32 pb_index = 19;
+  uint32 pb_head = 20;
+  bytes pb_heads = 21;  // 各 PB 块头原始字节,按块序
+  repeated bool pb_crc_oks = 22;
+  uint32 beacon_timestamp = 23;
+  uint32 beacon_line = 24;
+  uint32 beacon_type = 25;
+  uint32 beacon_netsn = 26;
+  uint64 beacon_cco_mac = 27;
+  uint32 beacon_period_cnt = 28;
+  uint32 beacon_rf_channel = 29;
+  uint32 beacon_rf_option = 30;
+  sint32 beacon_item_num = 31;
+  uint32 coord_duration = 32;
+  uint32 coord_shift = 33;
+  uint32 coord_neighbour_nid = 34;
+  uint32 coord_rf_channel = 35;
+  uint32 coord_rsv0 = 36;
+  uint32 coord_rsv1 = 37;
+  uint32 coord_rsv2 = 38;
+  uint32 coord_rsv3 = 39;
+  uint32 coord_band_end_flag = 40;
+  uint32 coord_option = 41;
+  uint32 coord_band_end_offset = 42;
+  uint32 coord_band_start_offset = 43;
+  uint32 ack_ext_type = 44;
+  uint32 ack_rx_res = 45;
+  uint32 ack_rx_status = 46;
+  uint32 ack_rx_pb_num = 47;
+  uint32 ack_rsv0 = 48;
+  uint32 ack_channel_quality = 49;
+  uint32 ack_sta_load = 50;
+  uint32 ack_rsv1 = 51;
+  uint64 ack_dst_addr = 52;
+  uint32 ack_search_tei = 53;
+  uint32 ack_search_freq = 54;
+  uint32 ack_sync_timestamp = 55;
+  uint32 ack_sync_tei = 56;
+}
+
+// 字段树节点(递归)
+message MsduFieldNode {
+  string name = 1;
+  string value = 2;
+  repeated MsduFieldNode children = 3;
+  sint32 rel_start = 4;  // -1=无对应字节
+  sint32 rel_len = 5;
+}
+
+message MsduInfo {
+  bool present = 1;
+  bool simple_head = 2;
+  uint32 msdu_seq = 3;
+  sint32 msdu_src_tei = 4;  // -1=无/简头
+  sint32 msdu_dst_tei = 5;
+  sint32 msdu_send_type = 6;  // -1=无
+  uint64 msdu_src_mac = 7;
+  uint64 msdu_dst_mac = 8;
+  uint64 sta_mac = 9;
+  uint32 vlan_tag = 10;
+  uint32 msdu_type = 11;
+  uint32 restart_count = 12;  // 0xFF=未知/无此字段
+  uint32 broadcast_direction = 13;
+  uint32 business_id = 14;  // 0xFF=非应用层报文
+  uint32 app_packet_type = 15;  // 0xFF=非 NW 应用层
+  uint32 mme_type = 16;  // 0xFFFF=非管理消息
+  sint32 total_len = 17;  // -1=未知
+  string summary = 18;
+  repeated MsduFieldNode tree = 19;
+  repeated TeiMacPair tei_mac_pairs = 20;
+  TopoEvent topo_event = 21;
+}
+
+message BplcFrame {
+  PhysicalMeta meta = 1;
+  bytes data = 2;  // 反转义 + 去哨兵后的净荷
+  string error_reason = 3;
+  sint64 arrival_us = 4;
+  bytes raw_wire = 5;  // 原始串口帧(0x3C...0x3E 原样)
+  sint64 decoded_index = 6;
+  sint64 decoded_epoch_ms = 7;
+  TopoEvent topo_event = 8;
+  bool accepted = 9;
+  MpduInfo mpdu = 10;
+  string msdu_summary = 11;
+  bool msdu_present = 12;
+}
+
+message MsduState {
+  bytes buffer = 1;
+  sint32 received_count = 2;
+  sint32 expected_len = 3;
+  bool complete = 4;
+}
+
+message ParseFilter {
+  bool enable_type_filter = 1;
+  bool allow_beacon = 2;
+  bool allow_sof = 3;
+  bool allow_ack = 4;
+  bool allow_coord = 5;
+  bool link_hplc = 6;
+  bool link_hrf = 7;
+  bool nid_filter = 8;
+  uint32 nid_mask = 9;
+  repeated uint32 nid_list = 10;
+  bool tei_filter = 11;
+  repeated uint32 tei_list = 12;
+}
+
+message ParseResult {
+  PhysicalMeta meta = 1;
+  MpduInfo mpdu = 2;
+  bytes msdu_body = 3;
+  MsduInfo msdu = 4;
+  sint32 msdu_raw_base = 5;  // -1=跨帧
+  MsduInfo beacon = 6;
+  sint64 arrival_us = 7;
+  bytes raw_wire = 8;
+  bool accept = 9;
+  string reject_reason = 10;
+  bytes payload_for_log = 11;
+}
+
+message GraphicsEvent {
+  GraphicsEventType type = 1;
+  sint32 x = 2;
+  sint32 y = 3;
+  sint32 button = 4;  // Qt::MouseButton
+  sint32 modifiers = 5;  // Qt::KeyboardModifiers
+  sint32 delta_y = 6;  // Wheel: 1/8 度
+  sint32 width = 7;  // Resize: 新宽
+  sint32 height = 8;  // Resize: 新高
+}
+
+// ---- 消息体(关联一律走 Envelope.correlation_id,体内不再带 seq) ----
+message Hello {
+  uint32 api_version = 1;
+  string plugin_name = 2;
+  string plugin_id = 3;
+  repeated string capabilities = 4;  // 如 "parse","graphics"
+  uint32 proto_schema_version = 5;  // 本 schema = 1
+}
+
+message HelloAck {
+  bool ok = 1;
+  string reason = 2;
+  uint32 negotiated_schema_version = 3;
+}
+
+message ParseRequest {
+  BplcFrame frame = 1;
+  MsduState msdu = 2;
+  ParseFilter filter = 3;
+}
+
+message ParseResponse {
+  // 注意:accepted 与 result.accept 双写是旧线格式的既有行为,保持原样
+  bool accepted = 1;
+  ParseResult result = 2;
+  MsduState msdu = 3;
+}
+
+message ParseBatchItem {
+  uint64 item_seq = 1;
+  ParseRequest request = 2;
+}
+
+message ParseBatchRequest {
+  repeated ParseBatchItem items = 1;
+}
+
+message ParseBatchItemResponse {
+  uint64 item_seq = 1;
+  ParseResponse response = 2;
+}
+
+message ParseBatchResponse {
+  repeated ParseBatchItemResponse items = 1;
+}
+
+message RenderRequest {
+  sint32 width = 1;
+  sint32 height = 2;
+}
+
+message RenderResponse {
+  bool ok = 1;
+  bytes png_image = 2;  // PNG 编码字节;ok=false 时为空
+}
+
+message GraphicsEventMsg {
+  GraphicsEvent event = 1;
+}
+
+message EventAck {
+  bool needs_redraw = 1;
+}
+
+message ErrorMsg {
+  string message = 1;
+}
+
+// ---- 信封:线上一律只传 Envelope,类型由 body 的 oneof 区分 ----
+message Envelope {
+  uint64 correlation_id = 1;  // 请求/响应配对;单向消息(Shutdown/RequestRedraw)为 0
+  sint64 deadline_ms = 2;  // 绝对 epoch ms 截止点;0=无截止
+  Status status = 3;  // ERROR 时 error 字段说明原因
+  string error = 4;
+  oneof body {
+    Hello hello = 10;
+    HelloAck hello_ack = 11;
+    ParseRequest parse_request = 12;
+    ParseResponse parse_response = 13;
+    ParseBatchRequest parse_batch_request = 14;
+    ParseBatchResponse parse_batch_response = 15;
+    RenderRequest render_request = 16;
+    RenderResponse render_response = 17;
+    GraphicsEventMsg graphics_event = 18;
+    EventAck event_ack = 19;
+    ErrorMsg error_msg = 20;
+    // 下列 bool 型单向/心跳消息:置 true 即表示该消息(以 oneof 存在性区分)
+    bool ping = 21;  // app→host 心跳;host 以 pong + 同 correlation_id 回复
+    bool shutdown = 22;  // app→host 优雅退出
+    bool request_redraw = 23;  // host→app 插件主动请求重绘
+    bool pong = 24;  // host→app 心跳回复
+  }
+}
