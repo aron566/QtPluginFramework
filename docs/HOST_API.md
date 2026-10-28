@@ -20,9 +20,12 @@ Any new `host.*` API must be agreed here before implementation.
   frame object or a host-to-script callback.
 - **Errors**: invalid arguments are ignored silently (no exception in
   the script). Host logs the misuse; the script keeps running.
-- **Versioning**: `plugin.json` carries `api_version`. Host-Control v1
-  is `api_version: 1`. New `host.*` methods bump the contract version
-  in this document; hosts advertise the contract version they implement.
+- **Versioning**: `plugin.json` carries `api_version`. The `host.*`
+  method set below is unchanged from Host-Control v1; `api_version: 2`
+  is the current baseline, whose change is the IPC wire format only
+  (QDataStream → protobuf Envelope, see `ipc/plugin_ipc.proto`).
+  New `host.*` methods bump the contract version in this document;
+  hosts advertise the contract version they implement.
 
 ## 2. Script → host (`host.*`)
 
@@ -85,7 +88,7 @@ tab; current variables:
 | Name | Meaning |
 |---|---|
 | `BPLC_APP_VERSION` | Host app version, e.g. `1.3.0` |
-| `BPLC_API_VERSION` | Plugin API version, currently `1` |
+| `BPLC_API_VERSION` | Plugin API version, currently `2` |
 | `BPLC_PLUGIN_DIR` | Absolute path of this plugin's directory |
 | `BPLC_DATA_DIR` | Host app-data root (`QStandardPaths::AppDataLocation`) |
 | `BPLC_LANG` | UI language: `zh` or `en` (follows the app's language setting) |
@@ -153,3 +156,9 @@ is reserved (see §5).
 - v1 (2026-10-02): scalar pass-through added (`accepted`,
   `rejectReason`, host-decoded `mpdu`, `msduPresent`/`msduSummary`);
   JS side no longer re-parses MPDU bytes. Contract published in this file.
+- api_version 2 (2026-10-28): IPC wire format moved from QDataStream
+  to protobuf Envelope (`ipc/plugin_ipc.proto`, `[quint32 length]
+  [Envelope]` framing, `correlation_id` pairing, batched parse with
+  chained MsduState); the `host.*` method set in this document is
+  unchanged. Manager-side single-reader mailbox replaces the old
+  blocking-read + `readyRead` race.
