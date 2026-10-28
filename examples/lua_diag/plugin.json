@@ -1,5 +1,5 @@
 {
-  "api_version": 1,
+  "api_version": 2,
   "author": "bplc",
   "description": "诊断插件:检查帧长度异常、TEI 为 0、全零载荷。",
   "description_en": "Diagnostic plugin: checks abnormal frame length, zero TEI, all-zero payload.",

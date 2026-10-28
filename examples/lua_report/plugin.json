@@ -1,5 +1,5 @@
 {
-  "api_version": 1,
+  "api_version": 2,
   "author": "bplc",
   "description": "报表插件:统计帧类型计数与 TEI 分布,输出 JSON 报表。",
   "description_en": "Report plugin: counts frame types and TEI distribution, outputs a JSON report.",

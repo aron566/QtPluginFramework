@@ -1,5 +1,6 @@
 /// @file native_backend.cpp
 #include "native_backend.h"
+#include "plugin_ipc.h"
 #include <QDir>
 #include <QImage>
 #include <QPainter>
@@ -9,7 +10,7 @@ NativeBackend::~NativeBackend() {
 }
 
 bool NativeBackend::initialize(const PluginManifest& m, QString* err) {
-    if (m.api_version != 1) {
+    if (m.api_version != plugin_ipc::kApiVersion) {
         *err = QStringLiteral("api_version mismatch");
         return false;
     }

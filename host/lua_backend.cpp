@@ -8,6 +8,7 @@
 #include <QPainter>
 
 #include "plugin_env.h"
+#include "plugin_ipc.h"
 #include "script_painter.h"
 
 extern "C" {
@@ -266,7 +267,7 @@ LuaBackend::~LuaBackend() {
 }
 
 bool LuaBackend::initialize(const PluginManifest& m, QString* err) {
-    if (m.api_version != 1) {
+    if (m.api_version != plugin_ipc::kApiVersion) {
         *err = QStringLiteral("api_version mismatch");
         return false;
     }

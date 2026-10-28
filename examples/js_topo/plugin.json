@@ -1,5 +1,5 @@
 {
-  "api_version": 1,
+  "api_version": 2,
   "author": "bplc",
   "description": "拓扑图形插件:消费解析器拓扑事件,与原版TOPO对齐(NID选择/映射表/帧记录/悬浮成功率)。",
   "description_en": "Topology graphics plugin: consumes parser topo events, aligned with the native TOPO page (NID selector, mapping table, frame records, hover success rates).",
