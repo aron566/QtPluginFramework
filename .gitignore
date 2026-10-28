@@ -8,3 +8,7 @@ Makefile
 # lua 源码解压目录(构建产物,tarball 在版本库)
 3rdparty/lua-5.4.6/
 !3rdparty/lua-5.4.6.tar.gz
+
+# protoc 生成物(qmake 时由 ipc.pri 生成,不提交,proto 是唯一事实来源)
+ipc/plugin_ipc.pb.cc
+ipc/plugin_ipc.pb.h
