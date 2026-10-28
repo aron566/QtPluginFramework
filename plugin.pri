@@ -3,6 +3,9 @@
 
 QT += core network
 
+# protobuf 代码生成 + 链接(见 ipc/ipc.pri)
+include($$PWD/ipc/ipc.pri)
+
 INCLUDEPATH += $$PWD/plugin_api $$PWD/ipc $$PWD/manager \
     $$PWD/include/common $$PWD/include/protocol
 DEPENDPATH += $$PWD/include/common $$PWD/include/protocol

@@ -1,10 +1,14 @@
 /// @file plugin_manager.cpp
-/// @brief PluginManager 实现
+/// @brief PluginManager 实现(protobuf Envelope + 单读者邮箱版)
+/// @details 读 socket 一律只在主线程 on_host_ready_read 里做,响应按
+///          correlation_id 投进 mailbox;同步等待者按线程分流:
+///          worker 线程等 QWaitCondition,主线程跑本地事件循环。
+///          旧"阻塞读 + readyRead 槽抢同一 socket"导致 ParseResponse
+///          被槽吞掉而假超时的竞态已消除(2026-10-21 定案)。
 #include "plugin_manager.h"
 #include "plugin_graphics_view.h"
 
 #include <QCoreApplication>
-#include <QDataStream>
 #include <QDateTime>
 #include <QDir>
 #include <QEventLoop>
@@ -15,15 +19,14 @@
 #include <QProcess>
 #include <QThread>
 #include <QTimer>
-#include <QThread>
 
 #include "plugin_ipc.h"
 #include "plugin_serialization.h"
 #include "plugin_parser_proxy.h"
 
 namespace {
-constexpr int kHandshakeTimeoutMs = 10000;
 constexpr int kParseTimeoutMs = 5000;
+constexpr int kGraphicsTimeoutMs = 5000;
 constexpr int kHeartbeatIntervalMs = 5000;
 constexpr int kHeartbeatTimeoutMs = 15000;
 } // namespace
@@ -43,8 +46,9 @@ PluginManager::~PluginManager() {
     for (auto* rt : m_plugins) {
         if (rt->socket) {
             // 优雅退出
-            QByteArray p;
-            send_message(rt, static_cast<quint8>(plugin_ipc::MsgType::Shutdown), p);
+            qtplugin::ipc::Envelope env;
+            env.set_shutdown(true);
+            send_envelope(rt, env);
             rt->socket->flush();
         }
         if (rt->process) {
@@ -129,7 +133,14 @@ void PluginManager::on_new_connection(const QString& plugin_id) {
     connect(rt->socket, &QLocalSocket::readyRead,
             this, [this, plugin_id]() { on_host_ready_read(plugin_id); });
     connect(rt->socket, &QLocalSocket::disconnected,
-            this, [this, plugin_id]() {
+            this, [this, plugin_id, rt]() {
+                // 等待者快速失败(不再等到超时)
+                {
+                    QMutexLocker lk(&rt->mailbox_mutex);
+                    rt->socket_gone = true;
+                }
+                rt->mailbox_cond.wakeAll();
+                emit response_arrived(0);  // 唤醒主线程等待者(其后查 socket_gone)
                 disable_plugin(plugin_id, QStringLiteral("host disconnected"));
             });
 }
@@ -139,40 +150,44 @@ void PluginManager::on_host_ready_read(const QString& plugin_id) {
     if (it == m_plugins.end() || !(*it)->socket) return;
     PluginRuntime* rt = *it;
     rt->rx_buf.append(rt->socket->readAll());
-    while (rt->rx_buf.size() >= 5) {
-        QDataStream hdr(rt->rx_buf);
-        hdr.setVersion(plugin_ipc::kStreamVersion);
-        quint32 len = 0;
-        hdr >> len;
-        if (rt->rx_buf.size() < 4 + (int)len) break;
-        const QByteArray frame = rt->rx_buf.mid(4, len);
+    // 帧:[quint32 大端长度][Envelope protobuf 字节]
+    while (rt->rx_buf.size() >= 4) {
+        const quint32 len =
+            (static_cast<quint8>(rt->rx_buf[0]) << 24) |
+            (static_cast<quint8>(rt->rx_buf[1]) << 16) |
+            (static_cast<quint8>(rt->rx_buf[2]) << 8) |
+            static_cast<quint8>(rt->rx_buf[3]);
+        if (rt->rx_buf.size() < 4 + static_cast<int>(len)) break;  // 等更多数据
+        const QByteArray bytes = rt->rx_buf.mid(4, len);
         rt->rx_buf.remove(0, 4 + len);
-        QDataStream ds(frame);
-        ds.setVersion(plugin_ipc::kStreamVersion);
-        quint8 t = 0;
-        ds >> t;
-        handle_message(plugin_id, t, ds);
+        qtplugin::ipc::Envelope env;
+        if (!env.ParseFromArray(bytes.constData(), static_cast<int>(bytes.size())))
+            continue;  // 坏包丢弃,长度成帧保证不失同步
+        handle_envelope(plugin_id, env);
     }
 }
 
-void PluginManager::handle_message(const QString& plugin_id, quint8 type,
-                                  QDataStream& ds) {
+void PluginManager::handle_envelope(const QString& plugin_id,
+                                    const qtplugin::ipc::Envelope& env) {
     auto it = m_plugins.find(plugin_id);
     if (it == m_plugins.end()) return;
     PluginRuntime* rt = *it;
-    const auto t = static_cast<plugin_ipc::MsgType>(type);
-    switch (t) {
-    case plugin_ipc::MsgType::Hello: {
-        int api_ver = 0; QString name, proto;
-        ds >> api_ver >> name >> proto;
-        QByteArray p;
-        QDataStream o(&p, QIODevice::WriteOnly);
-        o.setVersion(plugin_ipc::kStreamVersion);
-        const bool ok = (api_ver == plugin_ipc::kApiVersion)
-                     && (proto == rt->manifest.protocol_id);
-        o << ok;
-        o << (ok ? QString() : QStringLiteral("api_version/protocol mismatch"));
-        send_message(rt, static_cast<quint8>(plugin_ipc::MsgType::HelloAck), p);
+    using Body = qtplugin::ipc::Envelope::BodyCase;
+    switch (env.body_case()) {
+    case Body::kHello: {
+        const qtplugin::ipc::Hello& h = env.hello();
+        const bool ok = (static_cast<int>(h.api_version()) == plugin_ipc::kApiVersion)
+                     && (QString::fromStdString(h.plugin_id()) == rt->manifest.protocol_id)
+                     && (static_cast<int>(h.proto_schema_version())
+                         == plugin_ipc::kProtoSchemaVersion);
+        qtplugin::ipc::Envelope ack;
+        ack.set_correlation_id(env.correlation_id());
+        qtplugin::ipc::HelloAck* a = ack.mutable_hello_ack();
+        a->set_ok(ok);
+        a->set_reason(ok ? std::string()
+                         : "api_version/protocol/schema mismatch");
+        a->set_negotiated_schema_version(plugin_ipc::kProtoSchemaVersion);
+        send_envelope(rt, ack);
         if (ok) {
             rt->ready = true;
             rt->last_pong_ms = QDateTime::currentMSecsSinceEpoch();
@@ -186,36 +201,131 @@ void PluginManager::handle_message(const QString& plugin_id, quint8 type,
         }
         break;
     }
-    case plugin_ipc::MsgType::Pong: {
-        quint64 seq = 0; ds >> seq; Q_UNUSED(seq);
+    case Body::kPong:
         rt->last_pong_ms = QDateTime::currentMSecsSinceEpoch();
+        deliver_or_drop(rt, env);  // 心跳 Ping 不登记等待,此处仅更新心跳
         break;
-    }
-    case plugin_ipc::MsgType::Error: {
-        quint64 seq = 0; QString msg;
-        ds >> seq >> msg; Q_UNUSED(seq);
+    case Body::kErrorMsg:
         // 解析错误不禁用插件,仅记录(可日志)
         break;
-    }
-    case plugin_ipc::MsgType::RequestRedraw: {
+    case Body::kRequestRedraw:
         // 插件主动请求重绘:通知所有注册的视图
         for (PluginGraphicsView* v : m_graphics_views.value(plugin_id))
             v->on_plugin_request_redraw();
         break;
-    }
-    default:
+    case Body::kParseResponse:
+    case Body::kRenderResponse:
+    case Body::kEventAck:
+        deliver_or_drop(rt, env);
         break;
+    default:
+        break;  // 未知/单向消息忽略
     }
 }
 
-void PluginManager::send_message(PluginRuntime* rt, quint8 type,
-                                const QByteArray& payload) {
+void PluginManager::deliver_or_drop(PluginRuntime* rt,
+                                    const qtplugin::ipc::Envelope& env) {
+    const quint64 seq = env.correlation_id();
+    bool deliver = false;
+    {
+        QMutexLocker lk(&rt->mailbox_mutex);
+        deliver = rt->pending_seqs.contains(seq);
+        if (deliver) rt->mailbox.insert(seq, env);
+    }
+    if (deliver) {
+        rt->mailbox_cond.wakeAll();
+        emit response_arrived(seq);
+    }
+    // 未登记等待的响应(过期/心跳)直接丢弃,不进 mailbox
+}
+
+void PluginManager::register_pending(PluginRuntime* rt, quint64 seq) {
+    QMutexLocker lk(&rt->mailbox_mutex);
+    rt->pending_seqs.insert(seq);
+}
+
+void PluginManager::unregister_pending(PluginRuntime* rt, quint64 seq) {
+    QMutexLocker lk(&rt->mailbox_mutex);
+    rt->pending_seqs.remove(seq);
+    rt->mailbox.remove(seq);
+}
+
+bool PluginManager::wait_for_envelope_worker(PluginRuntime* rt, quint64 seq,
+                                            int timeout_ms,
+                                            qtplugin::ipc::Envelope* out) {
+    QMutexLocker lk(&rt->mailbox_mutex);
+    const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + timeout_ms;
+    while (true) {
+        auto it = rt->mailbox.find(seq);
+        if (it != rt->mailbox.end()) {
+            *out = it.value();
+            rt->mailbox.erase(it);
+            return true;
+        }
+        if (rt->socket_gone) return false;
+        const qint64 remain = deadline - QDateTime::currentMSecsSinceEpoch();
+        if (remain <= 0) return false;
+        rt->mailbox_cond.wait(&rt->mailbox_mutex,
+                              static_cast<unsigned long>(remain));
+    }
+}
+
+bool PluginManager::wait_for_envelope_main(PluginRuntime* rt, quint64 seq,
+                                           int timeout_ms,
+                                           qtplugin::ipc::Envelope* out) {
+    // 响应可能在等待开始前已到,先查一次
+    {
+        QMutexLocker lk(&rt->mailbox_mutex);
+        auto it = rt->mailbox.find(seq);
+        if (it != rt->mailbox.end()) {
+            *out = it.value();
+            rt->mailbox.erase(it);
+            return true;
+        }
+        if (rt->socket_gone) return false;
+    }
+    QEventLoop loop;
+    QTimer deadline_timer;
+    deadline_timer.setSingleShot(true);
+    connect(&deadline_timer, &QTimer::timeout, &loop, &QEventLoop::quit);
+    // 投递信号:槽投 mailbox 后发,等待者退出本地循环
+    connect(this, &PluginManager::response_arrived, &loop,
+            [&loop](quint64 s) {
+                Q_UNUSED(s);
+                loop.quit();
+            });
+    // 兜底轮询:投递与 connect 之间的竞态窗口(信号已发但无人接)由它补
+    QTimer ticker;
+    ticker.setInterval(100);
+    connect(&ticker, &QTimer::timeout, &loop, [&loop, rt, seq]() {
+        QMutexLocker lk(&rt->mailbox_mutex);
+        if (rt->mailbox.contains(seq) || rt->socket_gone) loop.quit();
+    });
+    ticker.start();
+    deadline_timer.start(timeout_ms);
+    loop.exec();
+    QMutexLocker lk(&rt->mailbox_mutex);
+    auto it = rt->mailbox.find(seq);
+    if (it != rt->mailbox.end()) {
+        *out = it.value();
+        rt->mailbox.erase(it);
+        return true;
+    }
+    return false;
+}
+
+void PluginManager::send_envelope(PluginRuntime* rt,
+                                  const qtplugin::ipc::Envelope& env) {
     if (!rt->socket) return;
+    std::string bytes;
+    if (!env.SerializeToString(&bytes)) return;
     QByteArray frame;
-    QDataStream ds(&frame, QIODevice::WriteOnly);
-    ds.setVersion(plugin_ipc::kStreamVersion);
-    ds << quint32(1 + payload.size()) << type;
-    frame.append(payload);
+    const quint32 len = static_cast<quint32>(bytes.size());
+    frame.append(static_cast<char>((len >> 24) & 0xFF));
+    frame.append(static_cast<char>((len >> 16) & 0xFF));
+    frame.append(static_cast<char>((len >> 8) & 0xFF));
+    frame.append(static_cast<char>(len & 0xFF));
+    frame.append(bytes.data(), static_cast<int>(bytes.size()));
     rt->socket->write(frame);
     rt->socket->flush();
 }
@@ -231,68 +341,36 @@ bool PluginManager::parse_via_plugin(const QString& protocol_id,
 
     QMutexLocker lock(&rt->ipc_mutex);
     const quint64 seq = ++rt->seq;
+    register_pending(rt, seq);
 
-    QByteArray payload;
-    QDataStream o(&payload, QIODevice::WriteOnly);
-    o.setVersion(plugin_ipc::kStreamVersion);
-    o << seq << frame << msdu << filter;
-    send_message(rt, static_cast<quint8>(plugin_ipc::MsgType::ParseRequest), payload);
+    qtplugin::ipc::Envelope env;
+    env.set_correlation_id(seq);
+    qtplugin::ipc::ParseRequest* req = env.mutable_parse_request();
+    *req->mutable_frame() = plugin_proto::to_proto(frame);
+    *req->mutable_msdu() = plugin_proto::to_proto(msdu);
+    *req->mutable_filter() = plugin_proto::to_proto(filter);
+    send_envelope(rt, env);
 
-    // 阻塞等待响应(worker 线程调用,不阻塞 UI)
-    QByteArray resp_buf;
-    const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + kParseTimeoutMs;
-    bool got = false;
-    ParseResult r;
-    MsduState new_msdu;
-    while (QDateTime::currentMSecsSinceEpoch() < deadline) {
-        if (!rt->socket->waitForReadyRead(100)) {
-            if (rt->socket->state() != QLocalSocket::ConnectedState) break;
-            continue;
-        }
-        resp_buf.append(rt->socket->readAll());
-        // 尝试解析完整帧
-        while (resp_buf.size() >= 5) {
-            QDataStream hdr(resp_buf);
-            hdr.setVersion(plugin_ipc::kStreamVersion);
-            quint32 len = 0; hdr >> len;
-            if (resp_buf.size() < 4 + (int)len) break;
-            const QByteArray fr = resp_buf.mid(4, len);
-            resp_buf.remove(0, 4 + len);
-            QDataStream ds(fr);
-            ds.setVersion(plugin_ipc::kStreamVersion);
-            quint8 t = 0; ds >> t;
-            if (static_cast<plugin_ipc::MsgType>(t)
-                    == plugin_ipc::MsgType::ParseResponse) {
-                quint64 rseq = 0; bool ok = false;
-                ds >> rseq;
-                if (rseq != seq) continue;  // 非本次请求的响应(理论上不应发生)
-                ds >> ok;
-                if (ok) { ds >> r >> new_msdu; }
-                else { QString e; ds >> e; r.reject_reason = e; }
-                r.accept = ok;
-                got = true;
-                break;
-            }
-            // Pong 等其他消息:更新心跳后继续等
-            if (static_cast<plugin_ipc::MsgType>(t) == plugin_ipc::MsgType::Pong)
-                rt->last_pong_ms = QDateTime::currentMSecsSinceEpoch();
-        }
-        if (got) break;
-    }
-    if (!got) {
-        r.accept = false;
-        r.reject_reason = QStringLiteral("plugin parse timeout/crash");
-        // 超时很可能意味着 host 挂了,禁用插件
+    // 阻塞等待响应(worker 线程调用,不阻塞 UI;读只在主线程槽里做)
+    qtplugin::ipc::Envelope resp;
+    const bool got = wait_for_envelope_worker(rt, seq, kParseTimeoutMs, &resp);
+    unregister_pending(rt, seq);
+    if (!got
+        || resp.body_case() != qtplugin::ipc::Envelope::kParseResponse) {
+        // 超时/断开:很可能 host 挂了,禁用插件(与旧行为一致:不碰 *result)
         // 注意:不能在 worker 线程直接调 disable_plugin(涉及信号),标记即可
         rt->disabled = true;
-        rt->disable_reason = r.reject_reason;
+        rt->disable_reason = QStringLiteral("plugin parse timeout/crash");
         QMetaObject::invokeMethod(this, [this, protocol_id]() {
             emit plugin_status_changed(protocol_id, QStringLiteral("timeout-disabled"));
         }, Qt::QueuedConnection);
         return false;
     }
-    *result = r;
-    msdu = new_msdu;
+    const qtplugin::ipc::ParseResponse& pr = resp.parse_response();
+    *result = plugin_proto::from_proto(pr.result());
+    msdu = plugin_proto::from_proto(pr.msdu());
+    // 双写:外层 accepted 为准(与旧线格式 ok 字段语义一致;host 侧两者同值)
+    result->accept = pr.accepted();
     return true;
 }
 
@@ -319,6 +397,12 @@ void PluginManager::disable_plugin(const QString& plugin_id,
     rt->disabled = true;
     rt->disable_reason = reason;
     rt->ready = false;
+    {
+        QMutexLocker lk(&rt->mailbox_mutex);
+        rt->socket_gone = true;
+    }
+    rt->mailbox_cond.wakeAll();
+    emit response_arrived(0);
     if (m_registry.unregister_fn)
         m_registry.unregister_fn(rt->manifest.protocol_id);
     emit plugin_status_changed(plugin_id, QStringLiteral("disabled: ") + reason);
@@ -329,14 +413,13 @@ void PluginManager::checkHeartbeats() {
     for (auto it = m_plugins.begin(); it != m_plugins.end(); ++it) {
         PluginRuntime* rt = it.value();
         if (!rt->ready || rt->disabled || !rt->socket) continue;
-        // 发 Ping
+        // 发 Ping(不登记等待;Pong 回来只更新心跳,见 handle_envelope)
         {
             QMutexLocker lock(&rt->ipc_mutex);
-            QByteArray p;
-            QDataStream o(&p, QIODevice::WriteOnly);
-            o.setVersion(plugin_ipc::kStreamVersion);
-            o << ++rt->seq;
-            send_message(rt, static_cast<quint8>(plugin_ipc::MsgType::Ping), p);
+            qtplugin::ipc::Envelope env;
+            env.set_correlation_id(++rt->seq);
+            env.set_ping(true);
+            send_envelope(rt, env);
         }
         if (now - rt->last_pong_ms > kHeartbeatTimeoutMs) {
             disable_plugin(it.key(), QStringLiteral("heartbeat timeout"));
@@ -345,54 +428,6 @@ void PluginManager::checkHeartbeats() {
 }
 
 // ---- 图形(Phase3) ----
-
-namespace {
-constexpr int kGraphicsTimeoutMs = 5000;
-/// @brief 同步等待指定 seq 的响应(主线程调用,带事件循环防假死)
-template <typename Handler>
-bool wait_graphics_response(PluginRuntime* rt, quint64 seq,
-                            plugin_ipc::MsgType want, Handler&& on_frame) {
-    QByteArray resp_buf;
-    const qint64 deadline =
-        QDateTime::currentMSecsSinceEpoch() + kGraphicsTimeoutMs;
-    while (QDateTime::currentMSecsSinceEpoch() < deadline) {
-        // 主线程:用事件循环等待,避免界面假死
-        QEventLoop loop;
-        QTimer::singleShot(100, &loop, &QEventLoop::quit);
-        QObject::connect(rt->socket, &QLocalSocket::readyRead,
-                         &loop, &QEventLoop::quit);
-        loop.exec();
-        if (rt->socket->state() != QLocalSocket::ConnectedState) break;
-        resp_buf.append(rt->socket->readAll());
-        while (resp_buf.size() >= 5) {
-            QDataStream hdr(resp_buf);
-            hdr.setVersion(plugin_ipc::kStreamVersion);
-            quint32 len = 0; hdr >> len;
-            if (resp_buf.size() < 4 + static_cast<int>(len)) break;
-            const QByteArray fr = resp_buf.mid(4, len);
-            resp_buf.remove(0, 4 + len);
-            QDataStream ds(fr);
-            ds.setVersion(plugin_ipc::kStreamVersion);
-            quint8 t = 0; ds >> t;
-            const auto mt = static_cast<plugin_ipc::MsgType>(t);
-            if (mt == want) {
-                quint64 rseq = 0; ds >> rseq;
-                if (rseq != seq) continue;
-                on_frame(ds);
-                return true;
-            }
-            if (mt == plugin_ipc::MsgType::Pong)
-                rt->last_pong_ms = QDateTime::currentMSecsSinceEpoch();
-            // RequestRedraw 可能在等待中到达:直接处理
-            if (mt == plugin_ipc::MsgType::RequestRedraw) {
-                // 由外层 handle_message 统一处理,这里只标记
-                // (简化:忽略,视图的定时器会补)
-            }
-        }
-    }
-    return false;
-}
-} // namespace
 
 bool PluginManager::has_graphics(const QString& protocol_id) const {
     auto it = m_plugins.find(protocol_id);
@@ -410,22 +445,25 @@ QImage PluginManager::request_render(const QString& protocol_id,
 
     QMutexLocker lock(&rt->ipc_mutex);
     const quint64 seq = ++rt->seq;
-    QByteArray payload;
-    QDataStream o(&payload, QIODevice::WriteOnly);
-    o.setVersion(plugin_ipc::kStreamVersion);
-    o << seq << w << h;
-    send_message(rt, static_cast<quint8>(plugin_ipc::MsgType::RenderRequest),
-                 payload);
+    register_pending(rt, seq);
+    qtplugin::ipc::Envelope env;
+    env.set_correlation_id(seq);
+    qtplugin::ipc::RenderRequest* req = env.mutable_render_request();
+    req->set_width(w);
+    req->set_height(h);
+    send_envelope(rt, env);
 
-    QImage img;
-    const bool ok = wait_graphics_response(
-        rt, seq, plugin_ipc::MsgType::RenderResponse,
-        [&img](QDataStream& ds) {
-            bool rok = false;
-            ds >> rok >> img;
-            if (!rok) img = QImage();
-        });
-    return ok ? img : QImage();
+    qtplugin::ipc::Envelope resp;
+    const bool got = wait_for_envelope_main(rt, seq, kGraphicsTimeoutMs, &resp);
+    unregister_pending(rt, seq);
+    if (!got
+        || resp.body_case() != qtplugin::ipc::Envelope::kRenderResponse)
+        return QImage();
+    const qtplugin::ipc::RenderResponse& rr = resp.render_response();
+    if (!rr.ok()) return QImage();
+    return plugin_proto::image_from_png(
+        QByteArray(rr.png_image().data(),
+                   static_cast<int>(rr.png_image().size())));
 }
 
 bool PluginManager::send_graphics_event(const QString& protocol_id,
@@ -438,19 +476,18 @@ bool PluginManager::send_graphics_event(const QString& protocol_id,
 
     QMutexLocker lock(&rt->ipc_mutex);
     const quint64 seq = ++rt->seq;
-    QByteArray payload;
-    QDataStream o(&payload, QIODevice::WriteOnly);
-    o.setVersion(plugin_ipc::kStreamVersion);
-    o << seq << e;
-    send_message(rt,
-                 static_cast<quint8>(plugin_ipc::MsgType::GraphicsEventMsg),
-                 payload);
+    register_pending(rt, seq);
+    qtplugin::ipc::Envelope env;
+    env.set_correlation_id(seq);
+    *env.mutable_graphics_event()->mutable_event() = plugin_proto::to_proto(e);
+    send_envelope(rt, env);
 
-    bool redraw = false;
-    wait_graphics_response(
-        rt, seq, plugin_ipc::MsgType::EventAck,
-        [&redraw](QDataStream& ds) { ds >> redraw; });
-    return redraw;
+    qtplugin::ipc::Envelope resp;
+    const bool got = wait_for_envelope_main(rt, seq, kGraphicsTimeoutMs, &resp);
+    unregister_pending(rt, seq);
+    if (!got || resp.body_case() != qtplugin::ipc::Envelope::kEventAck)
+        return false;
+    return resp.event_ack().needs_redraw();
 }
 
 void PluginManager::register_graphics_view(const QString& protocol_id,
