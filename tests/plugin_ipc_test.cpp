@@ -102,6 +102,13 @@ RecvResult recv_msg(QLocalSocket* sock, int timeout_ms = 15000) {
     }
     QByteArray body;
     while (body.size() < (int)len) {
+        // 先 drain 已缓冲的数据:QLocalSocket 的 waitForReadyRead 在数据
+        // 已到达(与 header 同包到达)时仍可能返回 false、只等新数据;
+        // 不先读缓冲会恒超时(实测 avail=49 时 wait 恒 false)。
+        if (sock->bytesAvailable() > 0) {
+            body.append(sock->read(len - body.size()));
+            continue;
+        }
         if (!sock->waitForReadyRead(1000)) {
             if (timer.elapsed() > timeout_ms) {
                 r.error = QStringLiteral("timeout waiting for body");
