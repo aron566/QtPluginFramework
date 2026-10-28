@@ -1,9 +1,8 @@
 /// @file plugin_host.cpp
-/// @brief bplc-plugin-host 实现(多 backend)
+/// @brief bplc-plugin-host 实现(多 backend,protobuf Envelope 版)
 #include "plugin_host.h"
 
 #include <QCoreApplication>
-#include <QDataStream>
 #include <QTimer>
 
 #include "plugin_backend.h"
@@ -42,10 +41,12 @@ bool PluginHost::start(QString* err) {
         m_backend = nullptr;
         return false;
     }
-    // 插件主动请求重绘 → 发 RequestRedraw 给主进程
+    // 插件主动请求重绘 → 发 RequestRedraw 给主进程(单向,correlation_id=0)
     PluginHost* self = this;
     m_backend->set_redraw_callback([self]() {
-        self->send_message(plugin_ipc::MsgType::RequestRedraw, QByteArray());
+        qtplugin::ipc::Envelope env;
+        env.set_request_redraw(true);
+        self->send_envelope(env);
     });
     // 后端协议 id 须与清单一致
     if (m_backend->protocol_id() != m_manifest.protocol_id) {
@@ -76,31 +77,36 @@ int PluginHost::exec() {
 }
 
 void PluginHost::on_connected() {
-    // 握手
-    QByteArray p;
-    QDataStream ds(&p, QIODevice::WriteOnly);
-    ds.setVersion(plugin_ipc::kStreamVersion);
-    ds << plugin_ipc::kApiVersion << m_manifest.name << m_manifest.protocol_id;
-    send_message(plugin_ipc::MsgType::Hello, p);
+    // 握手:Hello(能力 + schema 协商;correlation_id=0,HelloAck 同值回)
+    qtplugin::ipc::Envelope env;
+    qtplugin::ipc::Hello* h = env.mutable_hello();
+    h->set_api_version(plugin_ipc::kApiVersion);
+    h->set_plugin_name(m_manifest.name.toStdString());
+    h->set_plugin_id(m_manifest.protocol_id.toStdString());
+    if (m_backend->has_graphics())
+        h->add_capabilities("graphics");
+    h->add_capabilities("parse");
+    h->set_proto_schema_version(plugin_ipc::kProtoSchemaVersion);
+    send_envelope(env);
 }
 
 void PluginHost::on_ready_read() {
     m_rx_buf.append(m_socket.readAll());
-    // 帧:[quint32 len][quint8 type][payload]
-    while (m_rx_buf.size() >= 5) {
-        QDataStream hdr(m_rx_buf);
-        hdr.setVersion(plugin_ipc::kStreamVersion);
-        quint32 len = 0;
-        hdr >> len;
-        if (m_rx_buf.size() < 4 + (int)len) break;  // 等更多数据
-        const QByteArray frame = m_rx_buf.mid(4, len);
+    // 帧:[quint32 len][Envelope protobuf 字节]
+    while (m_rx_buf.size() >= 4) {
+        const quint32 len =
+            (static_cast<quint8>(m_rx_buf[0]) << 24) |
+            (static_cast<quint8>(m_rx_buf[1]) << 16) |
+            (static_cast<quint8>(m_rx_buf[2]) << 8) |
+            static_cast<quint8>(m_rx_buf[3]);
+        if (m_rx_buf.size() < 4 + static_cast<int>(len)) break;  // 等更多数据
+        const QByteArray bytes = m_rx_buf.mid(4, len);
         m_rx_buf.remove(0, 4 + len);
 
-        QDataStream ds(frame);
-        ds.setVersion(plugin_ipc::kStreamVersion);
-        quint8 t = 0;
-        ds >> t;
-        handle_message(static_cast<plugin_ipc::MsgType>(t), ds);
+        qtplugin::ipc::Envelope env;
+        if (!env.ParseFromArray(bytes.constData(), static_cast<int>(bytes.size())))
+            continue;  // 坏包丢弃,长度成帧保证不失同步
+        handle_envelope(env);
     }
 }
 
@@ -113,104 +119,141 @@ void PluginHost::on_socket_error(QLocalSocket::LocalSocketError e) {
         QCoreApplication::exit(2);
 }
 
-void PluginHost::send_message(plugin_ipc::MsgType t, const QByteArray& payload) {
+void PluginHost::send_envelope(const qtplugin::ipc::Envelope& env) {
+    std::string bytes;
+    if (!env.SerializeToString(&bytes)) return;
     QByteArray frame;
-    QDataStream ds(&frame, QIODevice::WriteOnly);
-    ds.setVersion(plugin_ipc::kStreamVersion);
-    ds << quint32(1 + payload.size()) << static_cast<quint8>(t);
-    frame.append(payload);
+    const quint32 len = static_cast<quint32>(bytes.size());
+    frame.append(static_cast<char>((len >> 24) & 0xFF));
+    frame.append(static_cast<char>((len >> 16) & 0xFF));
+    frame.append(static_cast<char>((len >> 8) & 0xFF));
+    frame.append(static_cast<char>(len & 0xFF));
+    frame.append(bytes.data(), static_cast<int>(bytes.size()));
     m_socket.write(frame);
     m_socket.flush();
 }
 
-void PluginHost::handle_message(plugin_ipc::MsgType t, QDataStream& ds) {
-    switch (t) {
-    case plugin_ipc::MsgType::HelloAck: {
-        bool ok = false; QString reason;
-        ds >> ok >> reason;
-        m_hello_done = ok;
-        if (!ok) QCoreApplication::exit(3);
+void PluginHost::handle_envelope(const qtplugin::ipc::Envelope& env) {
+    switch (env.body_case()) {
+    case qtplugin::ipc::Envelope::kHelloAck: {
+        m_hello_done = env.hello_ack().ok();
+        if (!m_hello_done) QCoreApplication::exit(3);
         break;
     }
-    case plugin_ipc::MsgType::ParseRequest:
-        handle_parse_request(ds);
+    case qtplugin::ipc::Envelope::kParseRequest:
+        handle_parse_request(env.correlation_id(), env.parse_request());
         break;
-    case plugin_ipc::MsgType::RenderRequest:
-        handle_render_request(ds);
+    case qtplugin::ipc::Envelope::kParseBatchRequest:
+        handle_parse_batch(env.correlation_id(), env.parse_batch_request());
         break;
-    case plugin_ipc::MsgType::GraphicsEventMsg:
-        handle_graphics_event(ds);
+    case qtplugin::ipc::Envelope::kRenderRequest:
+        handle_render_request(env.correlation_id(), env.render_request());
         break;
-    case plugin_ipc::MsgType::Ping: {
-        quint64 seq = 0; ds >> seq;
-        QByteArray p; QDataStream o(&p, QIODevice::WriteOnly);
-        o.setVersion(plugin_ipc::kStreamVersion); o << seq;
-        send_message(plugin_ipc::MsgType::Pong, p);
+    case qtplugin::ipc::Envelope::kGraphicsEvent:
+        handle_graphics_event(env.correlation_id(), env.graphics_event());
+        break;
+    case qtplugin::ipc::Envelope::kPing: {
+        qtplugin::ipc::Envelope resp;
+        resp.set_correlation_id(env.correlation_id());
+        resp.set_pong(true);
+        send_envelope(resp);
         break;
     }
-    case plugin_ipc::MsgType::Shutdown:
+    case qtplugin::ipc::Envelope::kShutdown:
         QCoreApplication::quit();
         break;
     default:
-        break;
+        break;  // 未知/单向消息忽略
     }
 }
 
-void PluginHost::handle_parse_request(QDataStream& ds) {
-    quint64 seq = 0;
-    BplcFrame frame; MsduState msdu; ParseFilter filter;
-    ds >> seq >> frame >> msdu >> filter;
-
-    QByteArray resp;
-    QDataStream o(&resp, QIODevice::WriteOnly);
-    o.setVersion(plugin_ipc::kStreamVersion);
-    o << seq;
+qtplugin::ipc::ParseResponse PluginHost::do_parse(
+    const qtplugin::ipc::ParseRequest& req) {
+    qtplugin::ipc::ParseResponse resp;
     if (!m_hello_done || !m_backend) {
-        o << false;  // ok=false
-        o << QStringLiteral("not ready");
-    } else {
-        QString err;
-        const ParseResult r = m_backend->parse(frame, msdu, filter, &err);
-        // JS 等脚本后端可能置 err:accept=false 时 reject_reason 已填
-        o << r.accept << r << msdu;
-        Q_UNUSED(err);
+        // 旧线格式的 ok=false + "not ready" 对应:accepted=false,
+        // result.accept=false 且 reject_reason 说明原因
+        resp.set_accepted(false);
+        resp.mutable_result()->set_accept(false);
+        resp.mutable_result()->set_reject_reason("not ready");
+        *resp.mutable_msdu() = req.msdu();
+        return resp;
     }
-    send_message(plugin_ipc::MsgType::ParseResponse, resp);
+    BplcFrame frame = plugin_proto::from_proto(req.frame());
+    MsduState msdu = plugin_proto::from_proto(req.msdu());
+    ParseFilter filter = plugin_proto::from_proto(req.filter());
+    QString err;
+    const ParseResult r = m_backend->parse(frame, msdu, filter, &err);
+    // JS 等脚本后端可能置 err:accept=false 时 reject_reason 已填
+    Q_UNUSED(err);
+    resp.set_accepted(r.accept);
+    *resp.mutable_result() = plugin_proto::to_proto(r);
+    *resp.mutable_msdu() = plugin_proto::to_proto(msdu);
+    return resp;
 }
 
-void PluginHost::handle_render_request(QDataStream& ds) {
-    quint64 seq = 0; int w = 0, h = 0;
-    ds >> seq >> w >> h;
-
-    QByteArray resp;
-    QDataStream o(&resp, QIODevice::WriteOnly);
-    o.setVersion(plugin_ipc::kStreamVersion);
-    o << seq;
-    if (!m_hello_done || !m_backend || !m_backend->has_graphics()) {
-        o << false << QImage();
-    } else {
-        QString err;
-        const QImage img = m_backend->render_graphics(w, h, &err);
-        o << !img.isNull() << img;
-        Q_UNUSED(err);
-    }
-    send_message(plugin_ipc::MsgType::RenderResponse, resp);
+void PluginHost::handle_parse_request(quint64 corr,
+                                      const qtplugin::ipc::ParseRequest& req) {
+    qtplugin::ipc::Envelope env;
+    env.set_correlation_id(corr);
+    *env.mutable_parse_response() = do_parse(req);
+    send_envelope(env);
 }
 
-void PluginHost::handle_graphics_event(QDataStream& ds) {
-    quint64 seq = 0; GraphicsEvent e;
-    ds >> seq >> e;
+void PluginHost::handle_parse_batch(quint64 corr,
+                                    const qtplugin::ipc::ParseBatchRequest& batch) {
+    // 批内按顺序解析,MsduState 链式传递:首条用其自带 msdu,后续条目
+    // 用前一条的输出 msdu(自带 msdu 被忽略);响应按 item_seq 原样回填。
+    qtplugin::ipc::Envelope env;
+    env.set_correlation_id(corr);
+    qtplugin::ipc::ParseBatchResponse* out = env.mutable_parse_batch_response();
+    qtplugin::ipc::ParseRequest chained;
+    for (int i = 0; i < batch.items_size(); ++i) {
+        const qtplugin::ipc::ParseBatchItem& item = batch.items(i);
+        if (i == 0) {
+            chained = item.request();
+        } else {
+            chained = item.request();
+            *chained.mutable_msdu() = out->items(i - 1).response().msdu();
+        }
+        qtplugin::ipc::ParseBatchItemResponse* r = out->add_items();
+        r->set_item_seq(item.item_seq());
+        *r->mutable_response() = do_parse(chained);
+    }
+    send_envelope(env);
+}
 
-    QByteArray resp;
-    QDataStream o(&resp, QIODevice::WriteOnly);
-    o.setVersion(plugin_ipc::kStreamVersion);
-    o << seq;
+void PluginHost::handle_render_request(quint64 corr,
+                                       const qtplugin::ipc::RenderRequest& req) {
+    qtplugin::ipc::Envelope env;
+    env.set_correlation_id(corr);
+    qtplugin::ipc::RenderResponse* resp = env.mutable_render_response();
     if (!m_hello_done || !m_backend || !m_backend->has_graphics()) {
-        o << false;
+        resp->set_ok(false);
     } else {
         QString err;
-        o << m_backend->handle_graphics_event(e, &err);
+        const QImage img = m_backend->render_graphics(req.width(), req.height(), &err);
+        Q_UNUSED(err);
+        resp->set_ok(!img.isNull());
+        if (!img.isNull())
+            resp->set_png_image(plugin_proto::image_to_png(img).toStdString());
+    }
+    send_envelope(env);
+}
+
+void PluginHost::handle_graphics_event(quint64 corr,
+                                       const qtplugin::ipc::GraphicsEventMsg& msg) {
+    qtplugin::ipc::Envelope env;
+    env.set_correlation_id(corr);
+    qtplugin::ipc::EventAck* ack = env.mutable_event_ack();
+    if (!m_hello_done || !m_backend || !m_backend->has_graphics()) {
+        ack->set_needs_redraw(false);
+    } else {
+        QString err;
+        ack->set_needs_redraw(
+            m_backend->handle_graphics_event(
+                plugin_proto::from_proto(msg.event()), &err));
         Q_UNUSED(err);
     }
-    send_message(plugin_ipc::MsgType::EventAck, resp);
+    send_envelope(env);
 }

@@ -279,6 +279,9 @@ message ParseBatchItem {
   ParseRequest request = 2;
 }
 
+// 批解析:条目按顺序解析;MsduState 在条目间链式传递——首条用其自带
+// msdu,后续条目用前一条的输出 msdu(自带 msdu 被忽略)。响应按
+// item_seq 原样回填;主进程取最后一条的输出 msdu 作为新的重组状态。
 message ParseBatchRequest {
   repeated ParseBatchItem items = 1;
 }

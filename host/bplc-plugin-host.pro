@@ -19,6 +19,9 @@ DEPENDPATH  += ../include/common ../include/protocol ../include/protocol/common
 # Lua 5.4 (3rdparty 内嵌,缺失时自动获取源码并构建;见 lua_bundle.pri)
 include(../lua_bundle.pri)
 
+# protobuf 代码生成 + 链接(见 ipc/ipc.pri)
+include(../ipc/ipc.pri)
+
 HEADERS += \
     plugin_host.h \
     plugin_backend.h \
